@@ -21,6 +21,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <algorithm>
+#include <cstdio>
 
 #include <rclcpp/rclcpp.hpp>
 
@@ -31,6 +33,7 @@
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/highgui.hpp>
 
 // 프로젝트 모듈(순수 C++ 클래스)
 #include "vision/yolo_trt_engine.hpp"
@@ -56,8 +59,8 @@ public:
     const std::string engine_path = "/home/noh/my_cv/best_fp32.engine";
 
     // 점선 클래스 및 confidence threshold
-    const int   line_class_id = 0;
-    const float conf_thres    = 0.25f;
+    line_class_id_ = 0;
+    conf_thres_    = 0.25f;
 
     // 카메라 내참수(필요: 보정에서 광선 투영/회전 등을 쓰는 경우)
     const double fx = 600.0;
@@ -79,7 +82,7 @@ public:
     }
 
     yolo_ = std::make_unique<YoloTrtEngine>(engine_path);
-    point_extractor_ = std::make_unique<LinePointExtractor>(line_class_id, conf_thres);
+    point_extractor_ = std::make_unique<LinePointExtractor>(line_class_id_, conf_thres_);
 
     CoordinateRectifier::Intrinsics K{};
     K.fx = fx; K.fy = fy; K.cx = cx; K.cy = cy;
@@ -126,6 +129,14 @@ public:
     RCLCPP_INFO(get_logger(), "[SETUP] imu subscription created");
     RCLCPP_INFO(get_logger(), "[SETUP] features publisher created");
 
+    // ---- 추가: 디버그 시각화 창 ----
+    if (show_debug_view_)
+    {
+      cv::namedWindow(kDebugWindowName, cv::WINDOW_NORMAL);
+      // cv::resizeWindow(kDebugWindowName, 960, 540); // 필요하면 사용
+      RCLCPP_INFO(get_logger(), "[SETUP] debug window created: %s", kDebugWindowName);
+    }
+
     // ---- 추가: heartbeat(1Hz) ----
     hb_timer_ = create_wall_timer(
       std::chrono::seconds(1),
@@ -137,7 +148,24 @@ public:
       });
   }
 
+  ~LinePerceptionNode() override
+  {
+    if (show_debug_view_)
+    {
+      try
+      {
+        cv::destroyWindow(kDebugWindowName);
+      }
+      catch (...)
+      {
+        // GUI 환경에 따라 예외가 날 수 있으므로 무시 (노드 종료를 막지 않음)
+      }
+    }
+  }
+
 private:
+  static constexpr const char* kDebugWindowName = "LinePerception Debug";
+
   static double Deg2Rad(const double deg) { return deg * M_PI / 180.0; }
 
   void OnImu(const geometry_msgs::msg::Vector3Stamped::SharedPtr msg)
@@ -167,6 +195,60 @@ private:
       get_logger(),
       "[IMU] recv roll=%.5f pitch=%.5f (clamped) | imu_ready=%d",
       last_roll_rad_, last_pitch_rad_, imu_ready_ ? 1 : 0);
+  }
+
+  void DrawDetections(cv::Mat& vis, const std::vector<Detection>& dets)
+  {
+    // dets -> rectangle + center + label overlay
+    // 필수 가정:
+    //   Detection::box (cv::Rect)
+    //   Detection::class_id (int)
+    //   Detection::conf (float)
+    //
+    // 만약 필드명이 다르면 아래 3줄만 바꾸면 됩니다:
+    //   const cv::Rect box = det.box;
+    //   const int class_id = det.class_id;
+    //   const float conf   = det.confidence;
+
+    for (const auto& det : dets)
+    {
+      // (요청대로) 점선 클래스만 그리고 싶으면 필터
+      if (det.class_id != line_class_id_) continue;
+
+      // 1차 conf 필터도 동일하게 적용 (원하면 주석 처리 가능)
+      if (det.confidence < conf_thres_) continue;
+
+      const cv::Rect box = det.box;
+
+      // 영상 경계 안전 클리핑
+      cv::Rect clipped = box & cv::Rect(0, 0, vis.cols, vis.rows);
+      if (clipped.width <= 0 || clipped.height <= 0) continue;
+
+      const int cx = clipped.x + clipped.width / 2;
+      const int cy = clipped.y + clipped.height / 2;
+
+      // bbox + center
+      cv::rectangle(vis, clipped, cv::Scalar(0, 255, 0), 2);
+      cv::circle(vis, cv::Point(cx, cy), 3, cv::Scalar(0, 0, 255), -1);
+
+      // label (class_id + conf)
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), "id=%d %.2f", det.class_id, det.confidence);
+
+      int baseLine = 0;
+      const cv::Size textSize = cv::getTextSize(buf, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseLine);
+
+      int tx = clipped.x;
+      int ty = clipped.y - (textSize.height + 4);
+      if (ty < 0) ty = clipped.y + (textSize.height + 4); // 위쪽 공간 없으면 아래로
+
+      cv::Rect bg(tx, ty - textSize.height, textSize.width + 6, textSize.height + baseLine + 6);
+      bg &= cv::Rect(0, 0, vis.cols, vis.rows);
+
+      cv::rectangle(vis, bg, cv::Scalar(0, 0, 0), cv::FILLED);
+      cv::putText(vis, buf, cv::Point(bg.x + 3, bg.y + textSize.height + 2),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+    }
   }
 
   void OnImage(const sensor_msgs::msg::Image::SharedPtr msg)
@@ -234,6 +316,22 @@ private:
     {
       RCLCPP_ERROR(get_logger(), "[YOLO] Infer failed -> skip remaining stages");
       return;
+    }
+
+    // ---- 추가: 시각화(검출 bbox를 화면에 출력) ----
+    if (show_debug_view_)
+    {
+      cv::Mat vis = bgr.clone();
+      DrawDetections(vis, dets);
+
+      // 상태 텍스트(선택)
+      char buf[128];
+      std::snprintf(buf, sizeof(buf), "det=%zu (class=%d th=%.2f)", dets.size(), line_class_id_, conf_thres_);
+      cv::putText(vis, buf, cv::Point(10, 30),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2);
+
+      cv::imshow(kDebugWindowName, vis);
+      cv::waitKey(1);
     }
 
     // 4) Detection -> bbox 중심점(픽셀 좌표)
@@ -329,6 +427,11 @@ private:
   size_t imu_count_{0};
   size_t pub_count_{0};
   double last_img_stamp_sec_{0.0};
+
+  // ---- 추가: 시각화/필터 설정(멤버) ----
+  int line_class_id_{0};
+  float conf_thres_{0.25f};
+  bool show_debug_view_{true};
 };
 
 }  // namespace vision
