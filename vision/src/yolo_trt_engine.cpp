@@ -1,3 +1,5 @@
+// vision/src/yolo_trt_engine.cpp
+
 #include "vision/yolo_trt_engine.hpp"
 #include "vision/preprocess.cuh"   // CUDA 전처리 커널 런처
 
@@ -38,7 +40,6 @@ public:
 
 Logger gLogger;
 
-// Dims 출력 유틸
 static void PrintDims(const char* tag, const nvinfer1::Dims& d)
 {
   std::cout << tag << " nbDims=" << d.nbDims << " [";
@@ -50,7 +51,6 @@ static void PrintDims(const char* tag, const nvinfer1::Dims& d)
   std::cout << "]\n";
 }
 
-// Dims 비교(assert) 유틸: (nbDims, 각 d값) 완전 일치 검사
 static bool DimsEqual(const nvinfer1::Dims& a, const std::vector<int>& b)
 {
   if (a.nbDims != static_cast<int>(b.size())) return false;
@@ -61,60 +61,63 @@ static bool DimsEqual(const nvinfer1::Dims& a, const std::vector<int>& b)
   return true;
 }
 
-// output0 raw 통계 출력(레이아웃 2가지를 모두 확인)
-static void DumpOutputStats(const float* out, int C, int N, int sample_n = 5)
+inline int ClampInt(int v, int lo, int hi)
 {
-  auto dump_minmax_L1 = [&](int c) {
-    float mn =  std::numeric_limits<float>::infinity();
-    float mx = -std::numeric_limits<float>::infinity();
-    for (int i = 0; i < N; ++i)
-    {
-      const float v = out[c * N + i];
-      mn = std::min(mn, v);
-      mx = std::max(mx, v);
-    }
-    std::cout << "    L1 c" << c << " min=" << mn << " max=" << mx << "\n";
-  };
+  return (v < lo) ? lo : ((v > hi) ? hi : v);
+}
 
-  auto dump_minmax_L2 = [&](int c) {
-    float mn =  std::numeric_limits<float>::infinity();
-    float mx = -std::numeric_limits<float>::infinity();
-    for (int i = 0; i < N; ++i)
-    {
-      const float v = out[i * C + c];
-      mn = std::min(mn, v);
-      mx = std::max(mx, v);
-    }
-    std::cout << "    L2 c" << c << " min=" << mn << " max=" << mx << "\n";
-  };
+// --------------------------
+// NMS helpers (CPU)
+// --------------------------
+inline float IoU(const cv::Rect& a, const cv::Rect& b)
+{
+  const int x1 = std::max(a.x, b.x);
+  const int y1 = std::max(a.y, b.y);
+  const int x2 = std::min(a.x + a.width,  b.x + b.width);
+  const int y2 = std::min(a.y + a.height, b.y + b.height);
 
-  std::cout << "[RAW output0 stats] assume C=" << C << " N=" << N << "\n";
-  std::cout << "  Layout L1: out[c*N + i]\n";
-  for (int c = 0; c < C; ++c) dump_minmax_L1(c);
+  const int iw = std::max(0, x2 - x1);
+  const int ih = std::max(0, y2 - y1);
+  const int inter = iw * ih;
+  if (inter <= 0) return 0.0f;
 
-  std::cout << "  Layout L2: out[i*C + c]\n";
-  for (int c = 0; c < C; ++c) dump_minmax_L2(c);
+  const int area_a = a.width * a.height;
+  const int area_b = b.width * b.height;
+  const int uni = area_a + area_b - inter;
+  if (uni <= 0) return 0.0f;
 
-  // 샘플(앞부분 몇 개)도 같이 보기
-  std::cout << "  Samples (first " << sample_n << ")\n";
-  std::cout << "    L1:\n";
-  for (int i = 0; i < std::min(sample_n, N); ++i)
+  return static_cast<float>(inter) / static_cast<float>(uni);
+}
+
+static std::vector<vision::Detection> ApplyNms(
+  const std::vector<vision::Detection>& dets_sorted_desc,
+  float iou_thres,
+  int max_keep)
+{
+  std::vector<vision::Detection> kept;
+  kept.reserve(dets_sorted_desc.size());
+
+  for (const auto& d : dets_sorted_desc)
   {
-    std::cout << "      i=" << i << " : ";
-    for (int c = 0; c < C; ++c)
+    bool suppress = false;
+    for (const auto& k : kept)
     {
-      std::cout << out[c * N + i] << (c + 1 < C ? ' ' : '\n');
+      // class-aware NMS (지금은 class_id가 0뿐이지만 확장 대비)
+      if (d.class_id != k.class_id) continue;
+
+      if (IoU(d.box, k.box) > iou_thres)
+      {
+        suppress = true;
+        break;
+      }
+    }
+    if (!suppress)
+    {
+      kept.push_back(d);
+      if (max_keep > 0 && static_cast<int>(kept.size()) >= max_keep) break;
     }
   }
-  std::cout << "    L2:\n";
-  for (int i = 0; i < std::min(sample_n, N); ++i)
-  {
-    std::cout << "      i=" << i << " : ";
-    for (int c = 0; c < C; ++c)
-    {
-      std::cout << out[i * C + c] << (c + 1 < C ? ' ' : '\n');
-    }
-  }
+  return kept;
 }
 
 }  // namespace
@@ -141,7 +144,6 @@ YoloTrtEngine::YoloTrtEngine(const std::string& engine_path, int input_w, int in
 
 YoloTrtEngine::~YoloTrtEngine()
 {
-  // destructor에서는 throw 피하기 위해 cudaFree 계열만 직접 호출
   if (gpu_bgr_) cudaFree(gpu_bgr_);
   if (d_input_) cudaFree(d_input_);
   if (d_out_)   cudaFree(d_out_);
@@ -156,7 +158,6 @@ YoloTrtEngine::~YoloTrtEngine()
 
 bool YoloTrtEngine::LoadEngine(const std::string& engine_path)
 {
-  // 엔진 파일 로드
   std::ifstream file(engine_path, std::ios::binary | std::ios::ate);
   if (!file)
   {
@@ -227,7 +228,7 @@ bool YoloTrtEngine::LoadEngine(const std::string& engine_path)
     }
   }
 
-  // 실행 컨텍스트 기준 shape를 다시 조회(동적/정적 모두 여기 값이 “실제 런타임”)
+  // 실행 컨텍스트 기준 shape
   const auto in_dims  = context_->getTensorShape(in_name_.c_str());
   const auto out_dims = context_->getTensorShape(out_name_.c_str());
 
@@ -238,9 +239,7 @@ bool YoloTrtEngine::LoadEngine(const std::string& engine_path)
   PrintDims("       in_dims(context) =", in_dims);
   PrintDims("       out_dims(context)=", out_dims);
 
-  // === (요청 1) 여기서 shape assert로 “고정” ===
-  // 기대: images=1x3x640x640, output0=1x5x8400
-  // input_w_/input_h_는 생성자에서 받는 값이므로 (640,640) 전제면 아래가 맞아야 함.
+  // 기대: in=1x3xHxW, out=1x5x8400
   {
     const std::vector<int> expect_in  = {1, 3, input_h_, input_w_};
     const std::vector<int> expect_out = {1, 5, 8400};
@@ -258,41 +257,26 @@ bool YoloTrtEngine::LoadEngine(const std::string& engine_path)
     }
   }
 
-  // 입력 버퍼 할당
+  // 입력 버퍼
   size_t in_elems = 1;
-  for (int d = 0; d < in_dims.nbDims; ++d)
-  {
-    in_elems *= static_cast<size_t>(in_dims.d[d]);
-  }
+  for (int d = 0; d < in_dims.nbDims; ++d) in_elems *= static_cast<size_t>(in_dims.d[d]);
   CHECK_CUDA(cudaMalloc(&d_input_, in_elems * sizeof(float)));
 
-  // 출력 버퍼 할당
+  // 출력 버퍼
   out_elems_ = 1;
-  for (int d = 0; d < out_dims.nbDims; ++d)
-  {
-    out_elems_ *= static_cast<size_t>(out_dims.d[d]);
-  }
+  for (int d = 0; d < out_dims.nbDims; ++d) out_elems_ *= static_cast<size_t>(out_dims.d[d]);
   CHECK_CUDA(cudaMalloc(&d_out_, out_elems_ * sizeof(float)));
   CHECK_CUDA(cudaMallocHost(&h_out_, out_elems_ * sizeof(float)));
 
-  // 전처리 staging 초기화
   gpu_bgr_ = nullptr;
   gpu_bgr_size_ = 0;
 
-  std::cout << "       out_elems=" << out_elems_ << std::endl;
-
+  std::cout << " out_elems=" << out_elems_ << std::endl;
   return true;
 }
 
 void YoloTrtEngine::Preprocess(const cv::Mat& img, float* gpu_input)
 {
-  // 전제: preprocess 커널이
-  // - BGR8 -> RGB -> NCHW FP32
-  // - letterbox resize + pad
-  // - normalize
-  // 를 모두 수행
-
-  // (안전) Mat 연속성 보장
   cv::Mat src = img;
   if (!src.isContinuous())
   {
@@ -324,12 +308,12 @@ void YoloTrtEngine::Preprocess(const cv::Mat& img, float* gpu_input)
   PreprocessKernelLauncher(
     gpu_bgr_, src_w, src_h,
     gpu_input,
-    input_w_, input_h_,   // 최종 출력 크기(예: 640,640)
+    input_w_, input_h_,
     new_w, new_h,
     pad_x, pad_y,
     scale,
     stream_,
-    114                   // pad 값
+    114
   );
 }
 
@@ -346,10 +330,8 @@ bool YoloTrtEngine::Infer(const cv::Mat& img, std::vector<Detection>& detections
     return false;
   }
 
-  // 1) 전처리 -> d_input_
   Preprocess(img, reinterpret_cast<float*>(d_input_));
 
-  // 2) 바인딩(입력 1개, 출력 1개 가정)
   if (!context_->setTensorAddress(in_name_.c_str(), d_input_))
   {
     std::cerr << "[ERR] setTensorAddress(input) failed" << std::endl;
@@ -361,47 +343,129 @@ bool YoloTrtEngine::Infer(const cv::Mat& img, std::vector<Detection>& detections
     return false;
   }
 
-  // 3) 실행
   if (!context_->enqueueV3(stream_))
   {
     std::cerr << "[ERR] enqueueV3 failed" << std::endl;
     return false;
   }
 
-  // 4) 출력 복사(비동기) -> 이벤트 동기화
   CHECK_CUDA(cudaMemcpyAsync(h_out_, d_out_, out_elems_ * sizeof(float),
                              cudaMemcpyDeviceToHost, stream_));
   CHECK_CUDA(cudaEventRecord(ready_, stream_));
   CHECK_CUDA(cudaEventSynchronize(ready_));
 
-  // 5) 파싱(현재는 디코딩 보류: raw 통계 출력 모드)
   Postprocess(detections, img.cols, img.rows);
   return true;
 }
 
-void YoloTrtEngine::Postprocess(std::vector<Detection>& detections, int /*img_w*/, int /*img_h*/)
+void YoloTrtEngine::Postprocess(std::vector<Detection>& detections, int img_w, int img_h)
 {
   detections.clear();
 
-  // === (요청 2) (1,N,6) 가정 제거: raw output0 통계 출력 모드 ===
-  // output0: (1,5,8400) 가정(LoadEngine assert로 이미 고정됨)
-  // 여기서는 “디코딩”을 하지 않는다. (cxcywh / x1y1 등은 다음 단계)
-  // 대신 레이아웃 후보 2개(L1/L2)에 대해 min/max 및 샘플을 출력한다.
+  // output0 = (1,5,8400)
+  constexpr int C = 5;
+  constexpr int N = 8400;
 
-  // 로그 폭발 방지: 최초 1회만 출력
+  if (out_elems_ != static_cast<size_t>(C * N))
+  {
+    std::cerr << "[ERR] out_elems unexpected. out_elems=" << out_elems_
+              << " expected=" << (C * N) << std::endl;
+    return;
+  }
+
+  // 전처리와 동일한 letterbox 파라미터를 “원본 이미지 기준”으로 재계산
+  const float scale = std::min(input_w_ / static_cast<float>(img_w),
+                               input_h_ / static_cast<float>(img_h));
+  const int new_w = static_cast<int>(img_w * scale);
+  const int new_h = static_cast<int>(img_h * scale);
+  const int pad_x = (input_w_ - new_w) / 2;
+  const int pad_y = (input_h_ - new_h) / 2;
+
+  float max_conf = -std::numeric_limits<float>::infinity();
+  int cand = 0;
+
+  // 후보 생성(필터 + unpad)
+  for (int i = 0; i < N; ++i)
+  {
+    const float a0 = h_out_[0 * N + i];
+    const float a1 = h_out_[1 * N + i];
+    const float a2 = h_out_[2 * N + i];
+    const float a3 = h_out_[3 * N + i];
+    const float conf = h_out_[4 * N + i];
+
+    max_conf = std::max(max_conf, conf);
+    if (conf < conf_thres_) continue;
+    ++cand;
+
+    // 기본 가정: (cx,cy,w,h)
+    float cx = a0, cy = a1, w = a2, h = a3;
+
+    float x1 = cx - 0.5f * w;
+    float y1 = cy - 0.5f * h;
+    float x2 = cx + 0.5f * w;
+    float y2 = cy + 0.5f * h;
+
+    // letterbox 해제: (pad 제거 후) /scale
+    x1 = (x1 - static_cast<float>(pad_x)) / scale;
+    y1 = (y1 - static_cast<float>(pad_y)) / scale;
+    x2 = (x2 - static_cast<float>(pad_x)) / scale;
+    y2 = (y2 - static_cast<float>(pad_y)) / scale;
+
+    int ix1 = ClampInt(static_cast<int>(std::floor(x1)), 0, img_w - 1);
+    int iy1 = ClampInt(static_cast<int>(std::floor(y1)), 0, img_h - 1);
+    int ix2 = ClampInt(static_cast<int>(std::ceil (x2)), 0, img_w - 1);
+    int iy2 = ClampInt(static_cast<int>(std::ceil (y2)), 0, img_h - 1);
+
+    const int bw = std::max(0, ix2 - ix1);
+    const int bh = std::max(0, iy2 - iy1);
+    if (bw <= 0 || bh <= 0) continue;
+
+    Detection det;
+    det.box = cv::Rect(ix1, iy1, bw, bh);
+    det.confidence = conf;
+    det.class_id = 0; // 현재는 1클래스 가정
+    detections.push_back(det);
+  }
+
   static bool printed = false;
   if (!printed)
   {
     printed = true;
-    const int C = 5;
-    const int N = 8400;
-
-    std::cout << "[INFO] Postprocess in RAW-STATS mode (decode disabled)\n";
-    DumpOutputStats(h_out_, C, N, /*sample_n=*/5);
+    std::cout << "[Postprocess] conf_thres=" << conf_thres_
+              << " max_conf=" << max_conf
+              << " cand=" << cand
+              << " det(before_nms)=" << detections.size()
+              << std::endl;
   }
 
-  // detections는 비워둔 채로 리턴 (line_point_extractor 쪽에서도 비게 됨)
-  // 다음 단계에서 output0 형식 확정 후 디코딩을 구현하면 된다.
+  // ------------------------------------
+  // NMS (추가)
+  // ------------------------------------
+  // NMS 하이퍼파라미터: 필요하면 여기만 조절
+  constexpr float kNmsIouThres = 0.45f;
+  constexpr int   kMaxDetections = 300;  // 0이면 제한 없음
+
+  // score desc sort
+  std::sort(detections.begin(), detections.end(),
+            [](const Detection& a, const Detection& b){ return a.confidence > b.confidence; });
+
+  // apply NMS
+  {
+    const auto before = detections.size();
+    detections = ApplyNms(detections, kNmsIouThres, kMaxDetections);
+    const auto after = detections.size();
+
+    static bool nms_printed = false;
+    if (!nms_printed)
+    {
+      nms_printed = true;
+      std::cout << "[NMS] iou_thres=" << kNmsIouThres
+                << " max_keep=" << kMaxDetections
+                << " before=" << before
+                << " after=" << after
+                << std::endl;
+    }
+  }
 }
 
 }  // namespace vision

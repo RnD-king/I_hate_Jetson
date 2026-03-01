@@ -46,7 +46,7 @@ private:
   // 설정
   int input_w_{640};
   int input_h_{640};
-  float conf_thres_{0.25f};
+  float conf_thres_{0.45f};
 
   // TensorRT 객체
   struct TrtDeleter

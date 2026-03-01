@@ -142,7 +142,7 @@ FeatureExtractor::Features FeatureExtractor::Compute(
   // 5) mean_conf
   //    - 현재 입력에 confidence가 없으므로 0 고정
   // -----------------------------
-  f.mean_conf = 0.0;
+  // f.mean_conf = 0.0;
 
   return f;
 }

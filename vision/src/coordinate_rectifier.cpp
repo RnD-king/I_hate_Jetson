@@ -5,7 +5,7 @@
 namespace vision
 {
 
-CoordinateRectifier::CoordinateRectifier(const Intrinsics& K)
+CoordinateRectifier::CoordinateRectifier(const Intrinsics& K) // 라디안으로 받아오는 중
 : K_(K)
 {
 }

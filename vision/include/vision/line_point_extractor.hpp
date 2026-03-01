@@ -20,7 +20,7 @@ public:
 
 private:
   int line_class_id_{0};
-  float conf_thres_{0.25f};
+  float conf_thres_{0.45f};
 };
 
 }  // namespace vision
