@@ -47,7 +47,7 @@ public:
     const std::string imu_topic      = "/imu/filtered";
     const std::string features_topic = "/line_features";
 
-    // YOLO 엔진 경로
+    // YOLO 엔진 경로 (사용자가 수정한다고 했으므로 그대로 둠)
     const std::string engine_path = "/home/noh/my_cv/best_fp32.engine";
 
     line_class_id_ = 0;
@@ -104,31 +104,25 @@ public:
     RCLCPP_INFO(get_logger(), "  features_topic : %s", features_topic.c_str());
     RCLCPP_INFO(get_logger(), "  engine_path    : %s", engine_path.c_str());
 
-    RCLCPP_INFO(get_logger(), "[SETUP] image subscription created (RELIABLE + TRANSIENT_LOCAL, KeepLast=1)");
-    RCLCPP_INFO(get_logger(), "[SETUP] imu subscription created");
-    RCLCPP_INFO(get_logger(), "[SETUP] features publisher created");
-
     if (show_debug_view_)
     {
       cv::namedWindow(kDebugWindowName, cv::WINDOW_NORMAL);
       RCLCPP_INFO(get_logger(), "[SETUP] debug window created: %s", kDebugWindowName);
     }
 
-    // ---- heartbeat(1Hz) ----
+    // ---- heartbeat(1Hz): 로그는 여기서만 출력 ----
     hb_timer_ = create_wall_timer(
       std::chrono::seconds(1),
-      [this]() {
-        RCLCPP_INFO(
-          get_logger(),
-          "[HB] frames=%zu imu=%zu pub=%zu (last_img_stamp=%.9f)",
-          frames_count_, imu_count_, pub_count_, last_img_stamp_sec_);
-      });
+      std::bind(&LinePerceptionNode::OnHeartbeat, this));
 
     // ---- PERF(1초 갱신) 초기화: "오버레이만" ----
     last_report_time_ = this->get_clock()->now();
     perf_frame_count_ = 0;
     perf_total_time_sec_ = 0.0;
     perf_text_ = "PING: -- ms | FPS: --";
+
+    // 요약 통계 초기화
+    ResetIntervalStats();
   }
 
   ~LinePerceptionNode() override
@@ -144,9 +138,75 @@ private:
   static constexpr const char* kDebugWindowName = "LinePerception Debug";
   static double Deg2Rad(const double deg) { return deg * M_PI / 180.0; }
 
+  // ----------------------------
+  // 1Hz heartbeat에서만 로그 출력
+  // ----------------------------
+  void OnHeartbeat()
+  {
+    // interval stats는 콜백에서 업데이트되므로, 락으로 스냅샷
+    IntervalStats snap;
+    {
+      std::lock_guard<std::mutex> lock(stats_mutex_);
+      snap = interval_stats_;
+      ResetIntervalStatsNoLock();
+    }
+
+    // IMU 최신값 스냅샷(참고 출력용)
+    double roll = 0.0, pitch = 0.0;
+    bool imu_ready_snapshot = false;
+    {
+      std::lock_guard<std::mutex> lock(imu_mutex_);
+      roll  = last_roll_rad_;
+      pitch = last_pitch_rad_;
+      imu_ready_snapshot = imu_ready_;
+    }
+
+    // 1초 동안의 요약 로그
+    RCLCPP_INFO(
+      get_logger(),
+      "[HB] frames=%zu imu=%zu pub=%zu | img_ok=%zu img_fail=%zu | yolo_ok=%zu yolo_fail=%zu | cvb_fail=%zu | imu_ready=%d roll=%.5f pitch=%.5f | det_last=%zu centers_last=%zu",
+      snap.frames,
+      snap.imu_msgs,
+      snap.published,
+      snap.img_ok,
+      snap.img_fail,
+      snap.yolo_ok,
+      snap.yolo_fail,
+      snap.cv_bridge_fail,
+      imu_ready_snapshot ? 1 : 0,
+      roll, pitch,
+      snap.last_det_count,
+      snap.last_centers_count
+    );
+
+    RCLCPP_INFO(
+      get_logger(),
+      "[HB-TIME] yolo_last=%.3fms pts_last=%.3fms rect_last=%.3fms feat_last=%.3fms total_last=%.3fms | total_avg=%.3fms (n=%zu)",
+      snap.last_yolo_ms,
+      snap.last_pts_ms,
+      snap.last_rect_ms,
+      snap.last_feat_ms,
+      snap.last_total_ms,
+      (snap.total_count > 0) ? (snap.total_sum_ms / static_cast<double>(snap.total_count)) : 0.0,
+      snap.total_count
+    );
+
+    // 최근 에러 이유가 있으면 1초에 1번만 출력
+    if (!snap.last_error.empty())
+    {
+      RCLCPP_INFO(get_logger(), "[HB-ERR] last_error=%s", snap.last_error.c_str());
+    }
+  }
+
+  // ----------------------------
+  // IMU callback: 로그 출력 금지(1Hz로만)
+  // ----------------------------
   void OnImu(const geometry_msgs::msg::Vector3Stamped::SharedPtr msg)
   {
-    ++imu_count_;
+    {
+      std::lock_guard<std::mutex> lock(stats_mutex_);
+      interval_stats_.imu_msgs += 1;
+    }
 
     std::lock_guard<std::mutex> lock(imu_mutex_);
 
@@ -158,14 +218,7 @@ private:
 
     last_roll_rad_  = r;
     last_pitch_rad_ = p;
-
     imu_ready_ = true;
-
-    // (이 로그는 유지)
-    RCLCPP_INFO(
-      get_logger(),
-      "[IMU] recv roll=%.5f pitch=%.5f (clamped) | imu_ready=%d",
-      last_roll_rad_, last_pitch_rad_, imu_ready_ ? 1 : 0);
   }
 
   void DrawDetections(cv::Mat& vis, const std::vector<Detection>& dets)
@@ -222,13 +275,16 @@ private:
     }
   }
 
+  // ----------------------------
+  // Image callback: 로그 출력 금지(1Hz로만)
+  // ----------------------------
   void OnImage(const sensor_msgs::msg::Image::SharedPtr msg)
   {
     const auto t0 = std::chrono::steady_clock::now();
-    ++frames_count_;
-
-    // (이 로그는 유지)
-    RCLCPP_INFO(get_logger(), "[STEP %zu] Start processing image", frames_count_);
+    {
+      std::lock_guard<std::mutex> lock(stats_mutex_);
+      interval_stats_.frames += 1;
+    }
 
     last_img_stamp_sec_ =
       static_cast<double>(msg->header.stamp.sec) +
@@ -242,15 +298,25 @@ private:
     }
     catch (const cv_bridge::Exception& e)
     {
-      RCLCPP_ERROR(get_logger(), "[IMG] cv_bridge 예외: %s", e.what());
+      std::lock_guard<std::mutex> lock(stats_mutex_);
+      interval_stats_.cv_bridge_fail += 1;
+      interval_stats_.img_fail += 1;
+      interval_stats_.last_error = std::string("cv_bridge: ") + e.what();
       return;
     }
 
     const cv::Mat& bgr = cv_ptr->image;
     if (bgr.empty())
     {
-      RCLCPP_WARN(get_logger(), "[IMG] 빈 이미지가 들어왔습니다.");
+      std::lock_guard<std::mutex> lock(stats_mutex_);
+      interval_stats_.img_fail += 1;
+      interval_stats_.last_error = "empty image";
       return;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(stats_mutex_);
+      interval_stats_.img_ok += 1;
     }
 
     // 2) IMU 최신값 스냅샷
@@ -262,9 +328,6 @@ private:
       pitch = last_pitch_rad_;
       imu_ready_snapshot = imu_ready_;
     }
-    // (이 로그는 유지)
-    RCLCPP_INFO(get_logger(), "[IMU] snapshot roll=%.5f pitch=%.5f | imu_ready=%d",
-                roll, pitch, imu_ready_snapshot ? 1 : 0);
 
     // 3) YOLO 추론
     std::vector<Detection> dets;
@@ -278,7 +341,10 @@ private:
 
     if (!ok)
     {
-      RCLCPP_ERROR(get_logger(), "[YOLO] Infer failed -> skip remaining stages");
+      std::lock_guard<std::mutex> lock(stats_mutex_);
+      interval_stats_.yolo_fail += 1;
+      interval_stats_.last_error = "yolo Infer failed (ok=false)";
+      // 디버그 뷰는 그대로 유지하되, 실패 시에는 그리지 않음(원 코드의 흐름 유지)
       return;
     }
 
@@ -294,13 +360,7 @@ private:
     const auto t5 = std::chrono::steady_clock::now();
     if (imu_ready_snapshot)
     {
-      RCLCPP_INFO(get_logger(), "[RECT] apply rectifier start");
       centers_rect_px = rectifier_->RectifyPixelPoints(centers_px, roll, pitch);
-      RCLCPP_INFO(get_logger(), "[RECT] apply rectifier done");
-    }
-    else
-    {
-      RCLCPP_INFO(get_logger(), "[RECT] skipped (imu_ready_=false)");
     }
     const auto t6 = std::chrono::steady_clock::now();
     const auto dt_rec_us =
@@ -329,27 +389,31 @@ private:
     // out.data.push_back(static_cast<float>(feats.mean_conf));
 
     features_pub_->publish(out);
-    ++pub_count_;
-
-    // (이 로그는 유지)
-    RCLCPP_INFO(get_logger(),
-      "[PUB] /line_features published | slope_mean=%.4f slope_var=%.4f x_mean=%.4f y_mean=%.4f count_norm=%.4f",
-      feats.slope_mean, feats.slope_var, feats.x_mean_norm, feats.y_mean_norm, feats.count_norm);
 
     const auto dt_all_us =
       std::chrono::duration_cast<std::chrono::microseconds>(t8 - t0).count();
 
-    // (이 로그는 유지)
-    RCLCPP_INFO(get_logger(),
-      "[TIME] yolo=%.4fms pts=%.4fms rect=%.4fms feat=%.4fms total=%.4fms",
-      static_cast<double>(dt_yolo_us) / 1000.0,
-      static_cast<double>(dt_pts_us)  / 1000.0,
-      static_cast<double>(dt_rec_us)  / 1000.0,
-      static_cast<double>(dt_feat_us) / 1000.0,
-      static_cast<double>(dt_all_us)  / 1000.0);
-
     // ===== PERF overlay 업데이트(1초에 1번만 문자열 갱신) =====
     UpdatePerfOverlayOncePerSecond(static_cast<double>(dt_all_us) * 1e-6);
+
+    // ---- interval stats 업데이트 (락 잡는 구간 최소화) ----
+    {
+      std::lock_guard<std::mutex> lock(stats_mutex_);
+      interval_stats_.yolo_ok += 1;
+      interval_stats_.published += 1;
+
+      interval_stats_.last_det_count = dets.size();
+      interval_stats_.last_centers_count = centers_px.size();
+
+      interval_stats_.last_yolo_ms  = static_cast<double>(dt_yolo_us) / 1000.0;
+      interval_stats_.last_pts_ms   = static_cast<double>(dt_pts_us)  / 1000.0;
+      interval_stats_.last_rect_ms  = static_cast<double>(dt_rec_us)  / 1000.0;
+      interval_stats_.last_feat_ms  = static_cast<double>(dt_feat_us) / 1000.0;
+      interval_stats_.last_total_ms = static_cast<double>(dt_all_us)  / 1000.0;
+
+      interval_stats_.total_sum_ms += interval_stats_.last_total_ms;
+      interval_stats_.total_count  += 1;
+    }
 
     // ---- 시각화 ----
     if (show_debug_view_)
@@ -357,7 +421,7 @@ private:
       cv::Mat vis = bgr.clone();
       DrawDetections(vis, dets);
 
-      // det 요약(매 프레임)
+      // det 요약(매 프레임 오버레이는 OK)
       {
         char buf[128];
         std::snprintf(buf, sizeof(buf), "det=%zu th=%.2f", dets.size(), conf_thres_);
@@ -372,6 +436,53 @@ private:
       cv::imshow(kDebugWindowName, vis);
       cv::waitKey(1);
     }
+  }
+
+private:
+  // ----------------------------
+  // interval stats 구조체
+  // ----------------------------
+  struct IntervalStats
+  {
+    // counts (1초 단위)
+    size_t frames{0};
+    size_t imu_msgs{0};
+    size_t published{0};
+
+    size_t img_ok{0};
+    size_t img_fail{0};
+    size_t cv_bridge_fail{0};
+
+    size_t yolo_ok{0};
+    size_t yolo_fail{0};
+
+    // last snapshots
+    size_t last_det_count{0};
+    size_t last_centers_count{0};
+
+    double last_yolo_ms{0.0};
+    double last_pts_ms{0.0};
+    double last_rect_ms{0.0};
+    double last_feat_ms{0.0};
+    double last_total_ms{0.0};
+
+    // avg total over interval
+    double total_sum_ms{0.0};
+    size_t total_count{0};
+
+    // last error string within the interval
+    std::string last_error{};
+  };
+
+  void ResetIntervalStats()
+  {
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    ResetIntervalStatsNoLock();
+  }
+
+  void ResetIntervalStatsNoLock()
+  {
+    interval_stats_ = IntervalStats{};
   }
 
 private:
@@ -394,10 +505,7 @@ private:
   double last_pitch_rad_{0.0};
   double imu_abs_limit_rad_{Deg2Rad(45.0)};
 
-  // 디버그 카운터
-  size_t frames_count_{0};
-  size_t imu_count_{0};
-  size_t pub_count_{0};
+  // 디버그 카운터(누적)
   double last_img_stamp_sec_{0.0};
 
   // ---- PERF 오버레이(1초 갱신) ----
@@ -410,6 +518,10 @@ private:
   int line_class_id_{0};
   float conf_thres_{0.60f};
   bool show_debug_view_{true};
+
+  // ---- 1초 요약 통계 ----
+  std::mutex stats_mutex_;
+  IntervalStats interval_stats_;
 };
 
 }  // namespace vision
