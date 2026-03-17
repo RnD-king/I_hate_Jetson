@@ -231,9 +231,9 @@ class DotsSplinePidFollower:
         self.imu_noise_std_deg = 0.0 # imu 노이즈 표준편차 (degrees)
 
         self.max_centers = 8 # 한 번에 인식 가능한 점 최대 개수 (카메라 시야 내에서)
-        self.per_pt_dropout_prob = 0.12 # 각 점마다 독립적으로 사라질 확률 (카메라 인식 실패 시뮬레이션)
-        self.burst_dropout_prob = 0.04 # 한 프레임 전체가 인식 실패할 확률 (카메라 프레임 드롭 시뮬레이션)
-        self.pixel_jitter_std = 1.2 # 점 위치에 픽셀 단위로 가우시안 노이즈 추가 (카메라 측정 잡음 시뮬레이션)
+        self.per_pt_dropout_prob = 0.12 # 각 점마다 독립적으로 사라질 확률 
+        self.burst_dropout_prob = 0.04 # 한 프레임 전체가 인식 실패할 확률 
+        self.pixel_jitter_std = 5.0 # 점 위치에 픽셀 단위로 가우시안 노이즈 추가 (표준편차 값)
 
         # ----- waypoint 모드일 때 -----
         self.num_waypoints = 26 # 웨이포인트 개수 (대략 하나당 1.3m)
