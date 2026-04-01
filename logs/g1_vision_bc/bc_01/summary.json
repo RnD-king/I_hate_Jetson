@@ -1,0 +1,17 @@
+{
+  "best_val_loss": 0.0005619576437095682,
+  "dataset_dir": "/home/noh/unitree/unitree_rl_gym/legged_gym/datasets/g1_vision/run_01_mixed_500",
+  "hidden_dims": [
+    128,
+    128
+  ],
+  "inference_test_mae": 0.009561251848936081,
+  "inference_test_mse": 0.00013121680240146816,
+  "input_dim": 32,
+  "num_files_after_filter": 303,
+  "num_files_before_filter": 500,
+  "run_dir": "/home/noh/unitree/unitree_rl_gym/legged_gym/logs/g1_vision_bc/bc_500eps_success_only_w1",
+  "split_by_episode": true,
+  "train_samples": 635689,
+  "val_samples": 68478
+}
