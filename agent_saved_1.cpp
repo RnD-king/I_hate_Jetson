@@ -1,5 +1,8 @@
 #include "agent.h"
 
+#include <cmath>
+#include <limits>
+
 using namespace std::chrono_literals;
 namespace apf {
 ApfAgent::ApfAgent() : rclcpp::Node("agent") {
@@ -19,15 +22,17 @@ ApfAgent::ApfAgent() : rclcpp::Node("agent") {
   auto agents_yaml = mission["agents"];
   number_of_agents = agents_yaml.size();
   agent_positions.resize(number_of_agents);
+  agent_goals.resize(number_of_agents);
   for (size_t id = 0; id < number_of_agents; id++) {
     agent_positions[id] = Vector3d(agents_yaml[id]["start"][0].as<double>(),
                                    agents_yaml[id]["start"][1].as<double>(),
                                    agents_yaml[id]["start"][2].as<double>());
+    agent_goals[id] = Vector3d(agents_yaml[id]["goal"][0].as<double>(),
+                               agents_yaml[id]["goal"][1].as<double>(),
+                               agents_yaml[id]["goal"][2].as<double>());
   }
   start = agent_positions[agent_id];
-  goal = Vector3d(agents_yaml[agent_id]["goal"][0].as<double>(),
-                  agents_yaml[agent_id]["goal"][1].as<double>(),
-                  agents_yaml[agent_id]["goal"][2].as<double>());
+  goal = agent_goals[agent_id];
 
   auto obstacles_yaml = mission["obstacles"];
   number_of_obstacles = obstacles_yaml.size();
@@ -60,6 +65,11 @@ ApfAgent::ApfAgent() : rclcpp::Node("agent") {
   // ROS publisher
   pub_pose = this->create_publisher<visualization_msgs::msg::MarkerArray>(
       "robot/pose", 10);
+  if (agent_id == 0) {
+    pub_distance_metrics =
+        this->create_publisher<std_msgs::msg::Float64MultiArray>(
+            "/distance_metrics", 10);
+  }
 
   std::cout << "[ApfAgent] Agent" << agent_id << " is ready." << std::endl;
 }
@@ -70,7 +80,10 @@ void ApfAgent::timer_tf_callback() {
   broadcast_tf();
 }
 
-void ApfAgent::timer_pub_callback() { publish_marker_pose(); }
+void ApfAgent::timer_pub_callback() {
+  publish_marker_pose();
+  publish_distance_metrics();
+}
 
 void ApfAgent::listen_tf() {
   for (size_t id = 0; id < number_of_agents; id++) {
@@ -147,14 +160,13 @@ Vector3d ApfAgent::apf_controller() {
   Vector3d u = Vector3d::Zero();
   const double eps = 1e-6;
 
-  const double k_goal = 2.0;
+  const double k_goal = 1.0;
   const double k_obs = 0.12;
-  const double k_agent = 0.08;
-  const double k_agent_tangent = 0.12;
+  const double k_agent = 0.22;
   const double k_damp = 2.2;
   const double goal_switch_dist = 1.5;
   const double obs_influence_dist = 1.2;
-  const double agent_influence_dist = 0.8;
+  const double agent_influence_dist = 0.5;
 
   // Attraction force
   Vector3d goal_error = goal - state.position;
@@ -212,12 +224,8 @@ Vector3d ApfAgent::apf_controller() {
         rho = eps;
       }
 
-      double repulsion =
-          k_agent * (1.0 / rho - 1.0 / agent_influence_dist) / (rho * rho);
-      Vector3d tangent(-direction.y(), direction.x(), 0.0);
-      double tangent_gain =
-          k_agent_tangent * (1.0 / rho - 1.0 / agent_influence_dist) / rho;
-      u_agent += repulsion * direction + tangent_gain * tangent;
+      u_agent += k_agent * (1.0 / rho - 1.0 / agent_influence_dist) /
+                 (rho * rho) * direction;
     }
   }
 
@@ -296,5 +304,74 @@ void ApfAgent::publish_marker_pose() {
   }
 
   pub_pose->publish(msg);
+}
+
+void ApfAgent::publish_distance_metrics() {
+  if (agent_id != 0 || !pub_distance_metrics) {
+    return;
+  }
+
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  double min_agent_obstacle_dist = nan;
+  double min_agent_agent_dist = nan;
+  double min_agent_obstacle_agent_id = -1.0;
+  double min_agent_obstacle_obs_id = -1.0;
+  double min_agent_agent_i = -1.0;
+  double min_agent_agent_j = -1.0;
+
+  std_msgs::msg::Float64MultiArray msg;
+  size_t goal_data_start = 6 + number_of_agents * number_of_obstacles;
+  msg.data.resize(goal_data_start + 1 + number_of_agents);
+
+  size_t data_id = 6;
+  for (size_t id = 0; id < number_of_agents; id++) {
+    for (size_t obs_id = 0; obs_id < number_of_obstacles; obs_id++) {
+      Vector3d diff = agent_positions[id] - obstacles[obs_id].position;
+      diff.z() = 0.0;
+      double surface_dist = diff.norm() - radius - obstacles[obs_id].radius;
+      msg.data[data_id++] = surface_dist;
+
+      if (std::isnan(min_agent_obstacle_dist) ||
+          surface_dist < min_agent_obstacle_dist) {
+        min_agent_obstacle_dist = surface_dist;
+        min_agent_obstacle_agent_id = static_cast<double>(id);
+        min_agent_obstacle_obs_id = static_cast<double>(obs_id);
+      }
+    }
+  }
+
+  for (size_t i = 0; i < number_of_agents; i++) {
+    for (size_t j = i + 1; j < number_of_agents; j++) {
+      Vector3d diff = agent_positions[i] - agent_positions[j];
+      diff.z() = 0.0;
+      double surface_dist = diff.norm() - 2.0 * radius;
+
+      if (std::isnan(min_agent_agent_dist) ||
+          surface_dist < min_agent_agent_dist) {
+        min_agent_agent_dist = surface_dist;
+        min_agent_agent_i = static_cast<double>(i);
+        min_agent_agent_j = static_cast<double>(j);
+      }
+    }
+  }
+
+  msg.data[0] = min_agent_obstacle_dist;
+  msg.data[1] = min_agent_agent_dist;
+  msg.data[2] = min_agent_obstacle_agent_id;
+  msg.data[3] = min_agent_obstacle_obs_id;
+  msg.data[4] = min_agent_agent_i;
+  msg.data[5] = min_agent_agent_j;
+
+  double goal_dist_sum = 0.0;
+  for (size_t id = 0; id < number_of_agents; id++) {
+    Vector3d goal_error = agent_goals[id] - agent_positions[id];
+    goal_error.z() = 0.0;
+    double goal_dist = goal_error.norm();
+    goal_dist_sum += goal_dist;
+    msg.data[goal_data_start + 1 + id] = goal_dist;
+  }
+  msg.data[goal_data_start] = goal_dist_sum / number_of_agents;
+
+  pub_distance_metrics->publish(msg);
 }
 } // namespace apf
