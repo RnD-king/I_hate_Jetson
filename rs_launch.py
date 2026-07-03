@@ -36,6 +36,7 @@ configurable_parameters = [{'name': 'camera_name',                  'default': '
                            {'name': 'enable_color',                 'default': 'true', 'description': 'enable color stream'},
                            {'name': 'rgb_camera.color_profile',     'default': '640,480,15', 'description': 'color stream profile'},
                            {'name': 'rgb_camera.color_format',      'default': 'RGB8', 'description': 'color stream format'},
+                           {'name': 'color_qos',                    'default': 'SENSOR_DATA', 'description': 'color image QoS'},
                            {'name': 'rgb_camera.enable_auto_exposure', 'default': 'true', 'description': 'enable/disable auto exposure for color image'}, # 자동 노출 끄기
                            {'name': 'rgb_camera.enable_auto_white_balance', 'default': 'true', 'description': 'enable/disable auto white balance for color image'}, # 자동 화밸 끄기
                            {'name': 'enable_depth',                 'default': 'true', 'description': 'enable depth stream'},
@@ -44,6 +45,7 @@ configurable_parameters = [{'name': 'camera_name',                  'default': '
                            {'name': 'enable_infra2',                'default': 'false', 'description': 'enable infra2 stream'},
                            {'name': 'depth_module.depth_profile',   'default': '640,480,15', 'description': 'depth stream profile'},
                            {'name': 'depth_module.depth_format',    'default': 'Z16', 'description': 'depth stream format'},
+                           {'name': 'depth_qos',                    'default': 'SENSOR_DATA', 'description': 'depth image QoS'},
                            {'name': 'depth_module.infra_profile',   'default': '640,480,15', 'description': 'infra streams (0/1/2) profile'},
                            {'name': 'depth_module.infra_format',    'default': 'RGB8', 'description': 'infra0 stream format'},
                            {'name': 'depth_module.infra1_format',   'default': 'Y8', 'description': 'infra1 stream format'},
@@ -61,7 +63,9 @@ configurable_parameters = [{'name': 'camera_name',                  'default': '
                            {'name': 'enable_gyro',                  'default': 'false', 'description': "'enable gyro stream'"},
                            {'name': 'enable_accel',                 'default': 'false', 'description': "'enable accel stream'"},
                            {'name': 'gyro_fps',                     'default': '0', 'description': "''"},
+                           {'name': 'gyro_qos',                     'default': 'SENSOR_DATA', 'description': 'gyro QoS'},
                            {'name': 'accel_fps',                    'default': '0', 'description': "''"},
+                           {'name': 'accel_qos',                    'default': 'SENSOR_DATA', 'description': 'accel QoS'},
                            {'name': 'unite_imu_method',             'default': "0", 'description': '[0-None, 1-copy, 2-linear_interpolation]'},
                            {'name': 'clip_distance',                'default': '-2.', 'description': "''"},
                            {'name': 'angular_velocity_cov',         'default': '0.01', 'description': "''"},
